@@ -35,16 +35,14 @@ WALLETS = {
     "LTC": "LPATdHDDiQZRhNUp77h8cELLne7Uoqk33Z",
     "BTC": "bc1qd4ga556dsnu468pejrqj6s25erxcztpawszd6s",
 }
-DB_FILE = "subscribers.json"
+
 PLANS = {
     "1day":  {"days": 1, "usd": 1.00, "label": "1 Day — $1"},
     "3day":  {"days": 3, "usd": 3.00, "label": "3 Days — $3"},
     "7day":  {"days": 7, "usd": 5.00, "label": "7 Days — $5"},
 }
 
-
-
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+DB_FILE = "subscribers.json"(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Subscriber DB ─────────────────────────────────────────────────────────────
@@ -58,7 +56,23 @@ def save_db(db):
     with open(DB_FILE, "w") as f:
         json.dump(db, f)
 
-def is_admin(user_id: str) -> bool:
+def track_user(user_id: str, username: str = "", first_name: str = ""):
+    db = load_db()
+    users = db.get("_users", {})
+    users[user_id] = {
+        "username": username,
+        "first_name": first_name,
+        "last_seen": datetime.utcnow().isoformat()
+    }
+    db["_users"] = users
+    save_db(db)
+
+def get_all_user_ids() -> list:
+    db = load_db()
+    users = db.get("_users", {})
+    return list(users.keys())
+
+
     return ADMIN_USER_ID and str(user_id) == str(ADMIN_USER_ID)
 
 def is_subscribed(user_id: str) -> bool:
@@ -222,6 +236,8 @@ def pay_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     first_name = update.effective_user.first_name or "there"
+    username = update.effective_user.username or ""
+    track_user(user_id, username, first_name)
 
     if is_subscribed(user_id):
         expiry = get_expiry(user_id)
@@ -415,6 +431,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Text message handler ──────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    track_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "")
     text = update.message.text.strip()
 
     # Transaction hash verification
@@ -575,6 +592,81 @@ async def listkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += "\n".join([f"`{k}`" for k in used]) or "None"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Admin only command.")
+        return
+    db = load_db()
+    users = db.get("_users", {})
+    if not users:
+        await update.message.reply_text("No users yet.")
+        return
+
+    lines = []
+    active = 0
+    for uid, info in users.items():
+        sub = db.get(uid, {})
+        expiry_str = ""
+        is_active = False
+        if sub.get("expiry"):
+            expiry = datetime.fromisoformat(sub["expiry"])
+            if datetime.utcnow() < expiry:
+                expiry_str = f"✅ until {expiry.strftime('%m/%d')}"
+                is_active = True
+            else:
+                expiry_str = "❌ expired"
+        else:
+            expiry_str = "❌ no sub"
+
+        if is_active:
+            active += 1
+
+        name = info.get("first_name", "")
+        uname = f"@{info['username']}" if info.get("username") else f"ID:{uid}"
+        last = info.get("last_seen", "")[:10]
+        lines.append(f"{uname} ({name}) — {expiry_str} — last seen {last}")
+
+    header = f"👥 *Users: {len(users)} total, {active} active*\n\n"
+    # Split into chunks to avoid Telegram message length limit
+    chunk = header
+    for line in lines:
+        if len(chunk) + len(line) > 3800:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ Admin only command.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/broadcast Your message here`\n\nSends to all users who have ever started the bot.",
+            parse_mode="Markdown"
+        )
+        return
+
+    message = " ".join(context.args)
+    user_ids = get_all_user_ids()
+    sent, failed = 0, 0
+
+    await update.message.reply_text(f"📢 Sending to {len(user_ids)} users...")
+
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=f"📢 *Message from Admin:*\n\n{message}", parse_mode="Markdown")
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(f"✅ Sent: {sent}\n❌ Failed: {failed}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -582,6 +674,8 @@ def main():
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("genkey", genkey))
     app.add_handler(CommandHandler("listkeys", listkeys))
     app.add_handler(CallbackQueryHandler(callback_handler))
