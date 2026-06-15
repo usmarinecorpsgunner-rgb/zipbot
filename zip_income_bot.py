@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram bot — ZIP code median income lookup with ETH payment gate.
-$1 = 7-day subscription, paid in ETH, verified via Etherscan API.
+Telegram bot — ZIP code median income lookup with crypto payment gate.
+
+Plans:
+  1 day  = $1
+  3 days = $3
+  7 days = $5
+
+Accepted crypto: ETH, BTC, LTC
 
 Env vars required:
   TELEGRAM_TOKEN    - from @BotFather
@@ -10,7 +16,7 @@ Env vars required:
   ADMIN_USER_ID     - your Telegram user ID (gets free access)
 """
 
-import os, json, logging, requests, secrets, string
+import os, json, logging, requests, secrets, string, base64
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -23,10 +29,20 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CENSUS_API_KEY    = os.getenv("CENSUS_API_KEY", "")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 ADMIN_USER_ID     = os.getenv("ADMIN_USER_ID", "")
-YOUR_ETH_WALLET   = "0xa00dbAF96a1bC5fa13868E2876B6e8303CeCd11D"
-PRICE_USD         = 1.00
-SUB_DAYS          = 7
-DB_FILE           = "subscribers.json"
+
+WALLETS = {
+    "ETH": "0xa00dbAF96a1bC5fa13868E2876B6e8303CeCd11D",
+    "LTC": "LPATdHDDiQZRhNUp77h8cELLne7Uoqk33Z",
+    "BTC": "bc1qd4ga556dsnu468pejrqj6s25erxcztpawszd6s",
+}
+
+PLANS = {
+    "1day":  {"days": 1, "usd": 1.00, "label": "1 Day — $1"},
+    "3day":  {"days": 3, "usd": 3.00, "label": "3 Days — $3"},
+    "7day":  {"days": 7, "usd": 5.00, "label": "7 Days — $5"},
+}
+
+DB_FILE = "subscribers.json"
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,9 +70,20 @@ def is_subscribed(user_id: str) -> bool:
     expiry = datetime.fromisoformat(db[user_id]["expiry"])
     return datetime.utcnow() < expiry
 
-def add_subscription(user_id: str):
+def add_subscription(user_id: str, days: int):
     db = load_db()
-    expiry = datetime.utcnow() + timedelta(days=SUB_DAYS)
+    # Extend if already subscribed
+    if user_id in db:
+        try:
+            current = datetime.fromisoformat(db[user_id]["expiry"])
+            if current > datetime.utcnow():
+                expiry = current + timedelta(days=days)
+                db[user_id] = {"expiry": expiry.isoformat()}
+                save_db(db)
+                return
+        except Exception:
+            pass
+    expiry = datetime.utcnow() + timedelta(days=days)
     db[user_id] = {"expiry": expiry.isoformat()}
     save_db(db)
 
@@ -71,24 +98,28 @@ def get_expiry(user_id: str) -> str:
         return "Expired"
     return expiry.strftime("%Y-%m-%d %H:%M UTC")
 
-# ── ETH helpers ───────────────────────────────────────────────────────────────
-def get_eth_price_usd() -> float:
+# ── Crypto price helpers ──────────────────────────────────────────────────────
+def get_crypto_price(coin: str) -> float:
+    ids = {"ETH": "ethereum", "BTC": "bitcoin", "LTC": "litecoin"}
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "ethereum", "vs_currencies": "usd"},
+            params={"ids": ids[coin], "vs_currencies": "usd"},
             timeout=10
         )
-        return float(r.json()["ethereum"]["usd"])
+        return float(r.json()[ids[coin]]["usd"])
     except Exception:
-        return float(os.getenv("ETH_PRICE_USD", "3000"))
+        defaults = {"ETH": 3000.0, "BTC": 60000.0, "LTC": 80.0}
+        return defaults[coin]
 
-def usd_to_eth(usd: float) -> float:
-    price = get_eth_price_usd()
-    return round(usd / price, 6)
+def usd_to_crypto(usd: float, coin: str) -> float:
+    price = get_crypto_price(coin)
+    amount = usd / price
+    decimals = 8 if coin in ("BTC", "LTC") else 6
+    return round(amount, decimals)
 
-# ── Etherscan verification ────────────────────────────────────────────────────
-def verify_tx(tx_hash: str, expected_eth: float) -> tuple[bool, str]:
+# ── Etherscan ETH verification ────────────────────────────────────────────────
+def verify_eth_tx(tx_hash: str, expected_eth: float) -> tuple[bool, str]:
     params = {
         "module": "proxy",
         "action": "eth_getTransactionByHash",
@@ -101,14 +132,49 @@ def verify_tx(tx_hash: str, expected_eth: float) -> tuple[bool, str]:
         if not tx:
             return False, "Transaction not found. Make sure it's confirmed on Ethereum mainnet."
         to_addr = (tx.get("to") or "").lower()
-        if to_addr != YOUR_ETH_WALLET.lower():
-            return False, "Transaction was not sent to the correct wallet."
+        if to_addr != WALLETS["ETH"].lower():
+            return False, "Transaction was not sent to the correct ETH wallet."
         value_eth = int(tx.get("value", "0x0"), 16) / 1e18
         if value_eth < expected_eth * 0.95:
             return False, f"Amount too low. Received {value_eth:.6f} ETH, expected ~{expected_eth:.6f} ETH."
         if not tx.get("blockNumber"):
             return False, "Transaction is still pending. Please wait for confirmation and try again."
         return True, f"Verified! Received {value_eth:.6f} ETH ✅"
+    except Exception as e:
+        return False, f"Verification error: {e}"
+
+# ── BTC/LTC verification via Blockchair ──────────────────────────────────────
+def verify_btc_ltc_tx(tx_hash: str, coin: str, expected_amount: float) -> tuple[bool, str]:
+    chain = "bitcoin" if coin == "BTC" else "litecoin"
+    wallet = WALLETS[coin].lower()
+    try:
+        r = requests.get(
+            f"https://api.blockchair.com/{chain}/dashboards/transaction/{tx_hash}",
+            timeout=15
+        )
+        data = r.json().get("data", {})
+        if not data or tx_hash not in data:
+            return False, "Transaction not found. Make sure it's confirmed and try again."
+        tx_data = data[tx_hash]
+        tx = tx_data.get("transaction", {})
+        outputs = tx_data.get("outputs", [])
+
+        # Check confirmations
+        confirmations = tx.get("block_id", 0)
+        if not confirmations or confirmations < 0:
+            return False, "Transaction is still pending. Wait for at least 1 confirmation."
+
+        # Check outputs for our wallet
+        received = 0
+        for out in outputs:
+            if out.get("recipient", "").lower() == wallet:
+                received += out.get("value", 0)
+
+        received_coin = received / 1e8
+        if received_coin < expected_amount * 0.95:
+            return False, f"Amount too low. Received {received_coin:.8f} {coin}, expected ~{expected_amount:.8f} {coin}."
+
+        return True, f"Verified! Received {received_coin:.8f} {coin} ✅"
     except Exception as e:
         return False, f"Verification error: {e}"
 
@@ -134,9 +200,23 @@ def get_median_income(zip_code: str) -> str:
         f"_(Source: US Census ACS 5-Year Estimates, 2022)_"
     )
 
-# ── Pay button keyboard ───────────────────────────────────────────────────────
+# ── Keyboards ─────────────────────────────────────────────────────────────────
+def plan_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 1 Day — $1",   callback_data="plan_1day")],
+        [InlineKeyboardButton("📅 3 Days — $3",  callback_data="plan_3day")],
+        [InlineKeyboardButton("📅 7 Days — $5",  callback_data="plan_7day")],
+    ])
+
+def coin_keyboard(plan_key: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Ξ ETH", callback_data=f"coin_{plan_key}_ETH"),
+         InlineKeyboardButton("₿ BTC", callback_data=f"coin_{plan_key}_BTC"),
+         InlineKeyboardButton("Ł LTC", callback_data=f"coin_{plan_key}_LTC")],
+    ])
+
 def pay_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay $1 in ETH", callback_data="pay")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("💳 Subscribe", callback_data="pay")]])
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -147,87 +227,77 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expiry = get_expiry(user_id)
         await update.message.reply_text(
             f"👋 Welcome back, *{first_name}*!\n\n"
-            f"✅ Your subscription is active until *{expiry}*\n\n"
-            f"📬 Just send any 5-digit US ZIP code and I'll look up the median household income for that area.\n\n"
+            f"✅ Subscription active until *{expiry}*\n\n"
+            f"Send any 5-digit US ZIP code to look up median household income.\n"
+            f"You can also send multiple ZIPs: `90210 10001 30301`\n"
+            f"Or send a *screenshot* with ZIP codes and I'll extract them!\n\n"
             f"*Commands:*\n"
+            f"• /pay — subscribe or renew\n"
             f"• /status — check your subscription\n"
-            f"• /pay — renew or pay\n"
-            f"• /help — show this guide",
+            f"• /help — show guide",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
             f"👋 Hey *{first_name}*, welcome to *ZIP Income Bot*!\n\n"
             f"📊 *What this bot does:*\n"
-            f"Send any US ZIP code and instantly get the median household income for that area — powered by US Census data.\n\n"
-            f"*Example:* Send `90210` → get Beverly Hills income data\n\n"
+            f"Send any US ZIP code and instantly get the median household income — powered by US Census data.\n\n"
+            f"*Example:* Send `90210` → Beverly Hills income data\n"
+            f"Send a *screenshot* of ZIPs and the bot reads them automatically!\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💳 *How to get access:*\n"
-            f"1️⃣ Click the button below\n"
-            f"2️⃣ Send *$1 worth of ETH* to the wallet shown\n"
-            f"3️⃣ Paste your transaction hash\n"
-            f"4️⃣ Get *7 days* of unlimited lookups ✅\n\n"
+            f"💳 *Plans:*\n"
+            f"📅 1 Day — $1\n"
+            f"📅 3 Days — $3\n"
+            f"📅 7 Days — $5\n\n"
+            f"Pay with *ETH, BTC, or LTC*\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"*Commands:*\n"
-            f"• /pay — subscribe for $1\n"
-            f"• /status — check your subscription\n"
-            f"• /help — show this guide",
+            f"• /pay — subscribe\n"
+            f"• /status — check subscription\n"
+            f"• /help — guide",
             parse_mode="Markdown",
-            reply_markup=pay_keyboard()
+            reply_markup=plan_keyboard()
         )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *ZIP Income Bot — Help Guide*\n\n"
+        "*Plans:*\n"
+        "📅 1 Day — $1\n"
+        "📅 3 Days — $3\n"
+        "📅 7 Days — $5\n\n"
+        "*Accepted crypto:* ETH, BTC, LTC\n\n"
         "*How to use:*\n"
-        "1. Subscribe for $1 in ETH (7 days access)\n"
-        "2. Send any 5-digit US ZIP code\n"
-        "3. Get the median household income instantly\n\n"
-        "*Commands:*\n"
-        "• /start — welcome screen\n"
-        "• /pay — subscribe or renew\n"
-        "• /status — check your subscription expiry\n"
-        "• /help — show this guide\n\n"
-        "*Paying:*\n"
-        "• Use /pay to get the ETH wallet + exact amount\n"
-        "• After sending, paste your tx hash (0x...)\n"
-        "• Bot verifies on Etherscan automatically\n\n"
+        "1. Use /pay to pick a plan and coin\n"
+        "2. Send the exact crypto amount shown\n"
+        "3. Paste your transaction hash to verify\n"
+        "4. Start looking up ZIP codes!\n\n"
+        "*ZIP lookups:*\n"
+        "• Single: `90210`\n"
+        "• Bulk: `90210 10001 30301`\n"
+        "• Screenshot: send a photo with ZIP codes\n\n"
+        "*Other:*\n"
+        "• Redeem a free key by typing it in chat\n"
+        "• /status — check expiry\n\n"
         "*Data source:* US Census ACS 5-Year Estimates (2022)",
         parse_mode="Markdown",
-        reply_markup=pay_keyboard()
+        reply_markup=plan_keyboard()
     )
 
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if is_subscribed(user_id):
         expiry = get_expiry(user_id)
-        await update.message.reply_text(f"✅ You're already subscribed until *{expiry}*.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ You're subscribed until *{expiry}*.\n\nPick a plan to extend:",
+            parse_mode="Markdown",
+            reply_markup=plan_keyboard()
+        )
         return
-    await send_pay_instructions(update.message.reply_text, context, user_id)
-
-async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = str(query.from_user.id)
-    if is_subscribed(user_id):
-        expiry = get_expiry(user_id)
-        await query.message.reply_text(f"✅ You're already subscribed until *{expiry}*.", parse_mode="Markdown")
-        return
-    await send_pay_instructions(query.message.reply_text, context, user_id)
-
-async def send_pay_instructions(reply_fn, context, user_id):
-    eth_amount = usd_to_eth(PRICE_USD)
-    context.user_data["expected_eth"] = eth_amount
-    await reply_fn(
-        f"💳 *Payment Instructions*\n\n"
-        f"Send exactly:\n"
-        f"```\n{eth_amount:.6f} ETH\n```\n"
-        f"To this wallet:\n"
-        f"```\n{YOUR_ETH_WALLET}\n```\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ After sending, paste your *transaction hash* (starts with 0x) here to verify.\n\n"
-        f"⏳ ETH amount is based on live price — run /pay again if you wait too long.",
-        parse_mode="Markdown"
+    await update.message.reply_text(
+        "💳 *Choose a plan:*",
+        parse_mode="Markdown",
+        reply_markup=plan_keyboard()
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,56 +308,203 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "❌ No active subscription.",
-            reply_markup=pay_keyboard()
+            reply_markup=plan_keyboard()
         )
 
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Plan selected → show coin picker
+    if data.startswith("plan_"):
+        plan_key = data[5:]
+        plan = PLANS.get(plan_key)
+        if not plan:
+            return
+        context.user_data["plan"] = plan_key
+        await query.message.reply_text(
+            f"📅 *{plan['label']}* selected.\n\nChoose your payment coin:",
+            parse_mode="Markdown",
+            reply_markup=coin_keyboard(plan_key)
+        )
+
+    # Coin selected → show payment instructions
+    elif data.startswith("coin_"):
+        _, plan_key, coin = data.split("_", 2)
+        plan = PLANS.get(plan_key)
+        if not plan:
+            return
+        amount = usd_to_crypto(plan["usd"], coin)
+        wallet = WALLETS[coin]
+        context.user_data["pending_plan"] = plan_key
+        context.user_data["pending_coin"] = coin
+        context.user_data["pending_amount"] = amount
+
+        await query.message.reply_text(
+            f"💳 *Payment Instructions*\n\n"
+            f"Plan: *{plan['label']}*\n"
+            f"Coin: *{coin}*\n\n"
+            f"Send exactly:\n"
+            f"```\n{amount} {coin}\n```\n"
+            f"To this wallet:\n"
+            f"```\n{wallet}\n```\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"After sending, paste your *transaction hash* here to verify.\n"
+            f"⏳ Amount based on live price — run /pay again if you wait too long.",
+            parse_mode="Markdown"
+        )
+
+    elif data == "pay":
+        await query.message.reply_text(
+            "💳 *Choose a plan:*",
+            parse_mode="Markdown",
+            reply_markup=plan_keyboard()
+        )
+
+# ── Screenshot ZIP extraction via Claude Vision ───────────────────────────────
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    if not is_subscribed(user_id):
+        await update.message.reply_text(
+            "🔒 *Access required!*\n\nPick a plan to get started.",
+            parse_mode="Markdown",
+            reply_markup=plan_keyboard()
+        )
+        return
+
+    await update.message.reply_text("📸 Reading your screenshot for ZIP codes...")
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    photo_bytes = await file.download_as_bytearray()
+    b64_image = base64.b64encode(photo_bytes).decode("utf-8")
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 500,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_image}
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract all US ZIP codes (5-digit numbers) from this image. "
+                                "Return ONLY the ZIP codes as a space-separated list with nothing else. "
+                                "Example output: 90210 10001 30301. "
+                                "If no ZIP codes are found, reply with: NONE"
+                            )
+                        }
+                    ]
+                }]
+            },
+            timeout=30
+        )
+        result_text = resp.json()["content"][0]["text"].strip()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to read image: {e}")
+        return
+
+    if result_text == "NONE" or not result_text:
+        await update.message.reply_text("⚠️ No ZIP codes found in that image.")
+        return
+
+    zips = [t for t in result_text.split() if t.isdigit() and len(t) == 5]
+    if not zips:
+        await update.message.reply_text("⚠️ No valid 5-digit ZIP codes detected.")
+        return
+
+    if len(zips) > 20:
+        await update.message.reply_text(f"⚠️ Found {len(zips)} ZIPs — showing first 20.")
+        zips = zips[:20]
+
+    await update.message.reply_text(f"✅ Found {len(zips)} ZIP(s): {' '.join(zips)}\n\n🔍 Looking up...")
+    results = [get_median_income(z) for z in zips]
+    await update.message.reply_text("\n\n".join(results), parse_mode="Markdown")
+
+# ── Text message handler ──────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = update.message.text.strip()
 
-    # Transaction hash
+    # Transaction hash verification
     if text.startswith("0x") and len(text) == 66:
-        expected_eth = context.user_data.get("expected_eth") or usd_to_eth(PRICE_USD)
-        await update.message.reply_text("🔍 Verifying your transaction on Etherscan...")
-        ok, msg = verify_tx(text, expected_eth)
+        # ETH tx hash
+        pending_coin = context.user_data.get("pending_coin", "ETH")
+        pending_amount = context.user_data.get("pending_amount")
+        pending_plan = context.user_data.get("pending_plan", "7day")
+        if not pending_amount:
+            pending_amount = usd_to_crypto(PLANS[pending_plan]["usd"], "ETH")
+        await update.message.reply_text("🔍 Verifying on Etherscan...")
+        ok, msg = verify_eth_tx(text, pending_amount)
         if ok:
-            add_subscription(user_id)
+            days = PLANS[pending_plan]["days"]
+            add_subscription(user_id, days)
             expiry = get_expiry(user_id)
             await update.message.reply_text(
-                f"🎉 *Payment confirmed!*\n\n"
-                f"{msg}\n\n"
-                f"✅ Subscription active until *{expiry}*\n\n"
-                f"Now send any 5-digit ZIP code to get started!",
+                f"🎉 *Payment confirmed!*\n\n{msg}\n\n"
+                f"✅ Subscription active until *{expiry}*\n\nSend any ZIP code to get started!",
                 parse_mode="Markdown"
             )
         else:
             await update.message.reply_text(f"❌ *Verification failed:*\n{msg}", parse_mode="Markdown")
         return
 
-    # ZIP lookup — single or bulk (space/comma/newline separated)
+    # BTC/LTC tx hash (64 hex chars)
+    if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
+        pending_coin = context.user_data.get("pending_coin")
+        pending_amount = context.user_data.get("pending_amount")
+        pending_plan = context.user_data.get("pending_plan", "7day")
+        if not pending_coin or pending_coin not in ("BTC", "LTC"):
+            await update.message.reply_text("⚠️ Please use /pay first to select your plan and coin, then paste your tx hash.")
+            return
+        if not pending_amount:
+            pending_amount = usd_to_crypto(PLANS[pending_plan]["usd"], pending_coin)
+        await update.message.reply_text(f"🔍 Verifying {pending_coin} transaction on Blockchair...")
+        ok, msg = verify_btc_ltc_tx(text, pending_coin, pending_amount)
+        if ok:
+            days = PLANS[pending_plan]["days"]
+            add_subscription(user_id, days)
+            expiry = get_expiry(user_id)
+            await update.message.reply_text(
+                f"🎉 *Payment confirmed!*\n\n{msg}\n\n"
+                f"✅ Subscription active until *{expiry}*\n\nSend any ZIP code to get started!",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"❌ *Verification failed:*\n{msg}", parse_mode="Markdown")
+        return
+
+    # ZIP lookup — single or bulk
     tokens = [t.strip().strip(",") for t in text.replace(",", " ").replace("\n", " ").split()]
     zips = [t for t in tokens if t.isdigit() and len(t) == 5]
 
     if zips:
         if not is_subscribed(user_id):
             await update.message.reply_text(
-                "🔒 *Access required!*\n\nSubscribe for just $1 to unlock ZIP income lookups for 7 days.",
+                "🔒 *Access required!*\n\nPick a plan to get started.",
                 parse_mode="Markdown",
-                reply_markup=pay_keyboard()
+                reply_markup=plan_keyboard()
             )
             return
+        if len(zips) > 20:
+            await update.message.reply_text("⚠️ Max 20 ZIPs at a time. Showing first 20.")
+            zips = zips[:20]
         if len(zips) == 1:
             await update.message.reply_text("🔍 Looking up...")
-            result = get_median_income(zips[0])
-            await update.message.reply_text(result, parse_mode="Markdown")
+            await update.message.reply_text(get_median_income(zips[0]), parse_mode="Markdown")
         else:
-            if len(zips) > 20:
-                await update.message.reply_text("⚠️ Max 20 ZIPs at a time. Showing first 20.")
-                zips = zips[:20]
             await update.message.reply_text(f"🔍 Looking up {len(zips)} ZIP codes...")
-            results = []
-            for z in zips:
-                results.append(get_median_income(z))
+            results = [get_median_income(z) for z in zips]
             await update.message.reply_text("\n\n".join(results), parse_mode="Markdown")
         return
 
@@ -299,15 +516,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if keys[text].get("used"):
                 await update.message.reply_text("❌ That key has already been used.")
             else:
+                days = keys[text].get("days", 1)
                 keys[text]["used"] = True
                 db["_keys"] = keys
                 save_db(db)
-                expiry = datetime.utcnow() + timedelta(days=keys[text].get("days", 1))
-                db2 = load_db()
-                db2[user_id] = {"expiry": expiry.isoformat()}
-                save_db(db2)
+                add_subscription(user_id, days)
+                expiry = get_expiry(user_id)
                 await update.message.reply_text(
-                    f"🎉 *Key redeemed!*\n\n✅ Access granted until *{expiry.strftime('%Y-%m-%d %H:%M UTC')}*\n\nSend any ZIP code to get started!",
+                    f"🎉 *Key redeemed!*\n\n✅ Access granted until *{expiry}*\n\nSend any ZIP code to get started!",
                     parse_mode="Markdown"
                 )
         else:
@@ -315,12 +531,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Send one or more 5-digit ZIP codes (space separated) to look up income.\n\nExample: `90210 10001 30301`\n\nNeed access? Use /pay or redeem a key.",
+        "Send one or more 5-digit ZIP codes or a screenshot.\n\nExample: `90210 10001 30301`\n\nNeed access? Use /pay",
         parse_mode="Markdown"
     )
 
 # ── Key generation (admin only) ───────────────────────────────────────────────
-def generate_key(days: int = 1) -> str:
+def generate_key() -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(16))
 
@@ -330,7 +546,6 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Admin only command.")
         return
 
-    # Parse days argument: /genkey 3  or /genkey (defaults to 1)
     days = 1
     if context.args:
         try:
@@ -338,7 +553,6 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
-    # Parse quantity: /genkey 1 5  (1 day, 5 keys)
     qty = 1
     if len(context.args) >= 2:
         try:
@@ -350,7 +564,7 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keys = db.get("_keys", {})
     new_keys = []
     for _ in range(qty):
-        k = generate_key(days)
+        k = generate_key()
         keys[k] = {"days": days, "used": False}
         new_keys.append(k)
     db["_keys"] = keys
@@ -358,8 +572,7 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key_list = "\n".join([f"`{k}`" for k in new_keys])
     await update.message.reply_text(
-        f"🔑 *Generated {qty} key(s) — {days} day(s) each:*\n\n{key_list}\n\n"
-        f"Share these with users. Each key is single-use.",
+        f"🔑 *Generated {qty} key(s) — {days} day(s) each:*\n\n{key_list}\n\nEach key is single-use.",
         parse_mode="Markdown"
     )
 
@@ -374,8 +587,8 @@ async def listkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No keys generated yet.")
         return
     unused = [k for k, v in keys.items() if not v.get("used")]
-    used = [k for k, v in keys.items() if v.get("used")]
-    msg = f"🔑 *Keys*\n\n✅ Unused ({len(unused)}):\n"
+    used   = [k for k, v in keys.items() if v.get("used")]
+    msg  = f"🔑 *Keys*\n\n✅ Unused ({len(unused)}):\n"
     msg += "\n".join([f"`{k}` ({keys[k]['days']}d)" for k in unused]) or "None"
     msg += f"\n\n❌ Used ({len(used)}):\n"
     msg += "\n".join([f"`{k}`" for k in used]) or "None"
@@ -390,7 +603,8 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("genkey", genkey))
     app.add_handler(CommandHandler("listkeys", listkeys))
-    app.add_handler(CallbackQueryHandler(pay_callback, pattern="^pay$"))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     logger.info("Bot is running...")
     app.run_polling()
