@@ -618,8 +618,24 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             json={"requests": [{"image": {"content": b64}, "features": [{"type": "TEXT_DETECTION"}]}]},
             timeout=15
         )
-        result = resp.json()
-        text = result["responses"][0].get("fullTextAnnotation", {}).get("text", "")
+        data = resp.json()
+
+        # Debug: catch API errors
+        if "error" in data:
+            await update.message.reply_text(f"❌ Google Vision error: {data['error'].get('message', 'Unknown error')}\n\nMake sure Cloud Vision API is enabled at console.cloud.google.com")
+            return
+
+        responses = data.get("responses", [])
+        if not responses:
+            await update.message.reply_text("⚠️ No response from Vision API.")
+            return
+
+        text = responses[0].get("fullTextAnnotation", {}).get("text", "")
+        if not text:
+            # Try textAnnotations fallback
+            annotations = responses[0].get("textAnnotations", [])
+            text = annotations[0].get("description", "") if annotations else ""
+
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to read image: {e}")
         return
