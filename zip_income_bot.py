@@ -602,10 +602,54 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_subscribed(user_id):
         await update.message.reply_text("🔒 Subscribe to use this feature.", reply_markup=plan_keyboard())
         return
-    await update.message.reply_text(
-        "📸 Screenshot reading is temporarily unavailable.\n\nType your ZIP codes instead: `90210 10001 30301`",
-        parse_mode="Markdown"
-    )
+
+    await update.message.reply_text("📸 Reading your screenshot...")
+
+    try:
+        import base64
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        photo_bytes = await file.download_as_bytearray()
+        b64 = base64.b64encode(photo_bytes).decode("utf-8")
+
+        api_key = os.getenv("GOOGLE_VISION_KEY", "")
+        resp = requests.post(
+            f"https://vision.googleapis.com/v1/images:annotate?key={api_key}",
+            json={"requests": [{"image": {"content": b64}, "features": [{"type": "TEXT_DETECTION"}]}]},
+            timeout=15
+        )
+        result = resp.json()
+        text = result["responses"][0].get("fullTextAnnotation", {}).get("text", "")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to read image: {e}")
+        return
+
+    zips = list(dict.fromkeys(re.findall(r'\b\d{5}\b', text)))
+    if not zips:
+        await update.message.reply_text("⚠️ No ZIP codes found in that image. Make sure ZIPs are clearly visible.")
+        return
+    if len(zips) > 20:
+        await update.message.reply_text(f"⚠️ Found {len(zips)} ZIPs — showing first 20.")
+        zips = zips[:20]
+
+    await update.message.reply_text(f"✅ Found {len(zips)} ZIP(s): {' '.join(zips)}\n\n🔍 Looking up...")
+    results = []
+    income_map = {}
+    for z in zips:
+        data = get_zip_data(z)
+        results.append(format_zip_report(z, data))
+        add_zip_history(user_id, z)
+        try:
+            income_map[z] = int(data.get("B19013_001E", -1))
+        except Exception:
+            income_map[z] = -1
+
+    await update.message.reply_text("\n\n".join(results), parse_mode="Markdown")
+    if len(zips) > 1:
+        ranked = sorted([(z, v) for z, v in income_map.items() if v > 0], key=lambda x: x[1], reverse=True)
+        if ranked:
+            ranking = "\n".join([f"{i+1}. `{z}` — ${v:,}" for i, (z, v) in enumerate(ranked)])
+            await update.message.reply_text(f"🏆 *Ranked by Income:*\n\n{ranking}", parse_mode="Markdown")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -740,6 +784,71 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def features_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚡ *ZIP Income Bot — Features*\n\n"
+        "📊 *Data per ZIP code:*\n"
+        "• Median household income\n"
+        "• Median home value\n"
+        "• Population\n"
+        "• Poverty rate\n"
+        "• Unemployment count\n\n"
+        "🔍 *Lookup options:*\n"
+        "• Single ZIP: `90210`\n"
+        "• Bulk ZIPs: `90210 10001 30301`\n"
+        "• Auto-ranks bulk results highest to lowest income\n"
+        "• Send a screenshot — bot reads ZIPs automatically\n\n"
+        "📋 *Tools:*\n"
+        "• /history — see your last 20 lookups\n"
+        "• /compare 90210 10001 — side by side comparison\n\n"
+        "💳 *Plans:*\n"
+        "• 1 Day — $1\n"
+        "• 3 Days — $3\n"
+        "• 7 Days — $5\n"
+        "• Pay with ETH, BTC, LTC, or USDT\n\n"
+        "🤝 *Referral program:*\n"
+        "• /refer — get your unique link\n"
+        "• Friend buys 3+ days → you get +1 free day!\n\n"
+        "🔑 *Have a key?*\n"
+        "• Use /redeem to activate it",
+        parse_mode="Markdown",
+        reply_markup=plan_keyboard()
+    )
+
+async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        # They passed the key as an argument: /redeem KEYHERE
+        key = context.args[0].strip().upper()
+        user_id = str(update.effective_user.id)
+        db = load_db()
+        keys = db.get("_keys", {})
+        if key in keys:
+            if keys[key].get("used"):
+                await update.message.reply_text("❌ That key has already been used.")
+            else:
+                days = keys[key].get("days", 1)
+                keys[key]["used"] = True
+                keys[key]["redeemed_by"] = user_id
+                keys[key]["redeemed_at"] = now_utc().isoformat()
+                db["_keys"] = keys
+                save_db(db)
+                add_subscription(user_id, days)
+                label = f"{int(days * 24)} hours" if days < 1 else f"{int(days)} days"
+                await update.message.reply_text(
+                    f"🎉 *Key redeemed!*\n\n✅ *{label}* of access granted!\n\nExpiry: *{get_expiry(user_id)}*\n\nSend any ZIP code to get started!",
+                    parse_mode="Markdown"
+                )
+        else:
+            await update.message.reply_text("❌ Invalid key. Double check it and try again.")
+    else:
+        await update.message.reply_text(
+            "🔑 *Redeem a Key*\n\n"
+            "Use your key like this:\n"
+            "`/redeem YOURKEYHERE`\n\n"
+            "Or just type your key directly in chat.",
+            parse_mode="Markdown"
+        )
+
 # ── Admin commands ────────────────────────────────────────────────────────────
 def generate_key() -> str:
     return "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))
@@ -748,8 +857,9 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
         await update.message.reply_text("❌ Admin only.")
         return
-    days = int(context.args[0]) if context.args else 1
+    days = float(context.args[0]) if context.args else 1
     qty = min(20, int(context.args[1])) if len(context.args) >= 2 else 1
+    label = f"{int(days * 24)}hr" if days < 1 else f"{days}day"
     db = load_db()
     keys = db.get("_keys", {})
     new_keys = []
@@ -761,7 +871,7 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_db(db)
     key_list = "\n".join([f"`{k}`" for k in new_keys])
     await update.message.reply_text(
-        f"🔑 *{qty} key(s) — {days} day(s):*\n\n{key_list}\n\nNever expire until redeemed.",
+        f"🔑 *{qty} key(s) — {label} each:*\n\n{key_list}\n\nNever expire until redeemed.",
         parse_mode="Markdown"
     )
 
@@ -890,6 +1000,8 @@ def main():
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("compare", compare_cmd))
     app.add_handler(CommandHandler("refer", refer_cmd))
+    app.add_handler(CommandHandler("features", features_cmd))
+    app.add_handler(CommandHandler("redeem", redeem_cmd))
     app.add_handler(CommandHandler("genkey", genkey))
     app.add_handler(CommandHandler("listkeys", listkeys))
     app.add_handler(CommandHandler("users", users_cmd))
