@@ -42,7 +42,9 @@ PLANS = {
     "7day":  {"days": 7, "usd": 5.00, "label": "7 Days — $5"},
 }
 
-DB_FILE = "subscribers.json"(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+DB_FILE = "subscribers.json"
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Subscriber DB ─────────────────────────────────────────────────────────────
