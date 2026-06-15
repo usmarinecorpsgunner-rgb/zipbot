@@ -42,10 +42,13 @@ PLANS = {
     "7day": {"days": 7, "usd": 5.00, "label": "7 Days — $5"},
 }
 
-DB_FILE = "subscribers.json"
+DB_FILE = os.getenv("DB_PATH", "/data/subscribers.json")
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Make sure data directory exists
+os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def now_utc():
@@ -451,6 +454,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 days = keys[text].get("days", 1)
                 keys[text]["used"] = True
+                keys[text]["redeemed_by"] = user_id
+                keys[text]["redeemed_at"] = now_utc().isoformat()
                 db["_keys"] = keys
                 save_db(db)
                 add_subscription(user_id, days)
@@ -482,13 +487,20 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_keys = []
     for _ in range(qty):
         k = generate_key()
-        keys[k] = {"days": days, "used": False}
+        keys[k] = {
+            "days": days,
+            "used": False,
+            "redeemed_by": None,
+            "created": now_utc().isoformat()
+            # No expiry — key stays valid until someone redeems it
+        }
         new_keys.append(k)
     db["_keys"] = keys
     save_db(db)
     key_list = "\n".join([f"`{k}`" for k in new_keys])
     await update.message.reply_text(
-        f"🔑 *Generated {qty} key(s) — {days} day(s) each:*\n\n{key_list}\n\nEach key is single-use.",
+        f"🔑 *Generated {qty} key(s) — {days} day(s) each:*\n\n{key_list}\n\n"
+        f"Keys never expire until redeemed. Each is single-use.",
         parse_mode="Markdown"
     )
 
