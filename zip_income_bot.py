@@ -350,38 +350,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=plan_keyboard()
         )
         return
-
-    await update.message.reply_text("📸 Reading your screenshot... (may take a few seconds)")
-
-    try:
-        import easyocr
-        import io
-        from PIL import Image
-        import numpy as np
-
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        photo_bytes = await file.download_as_bytearray()
-        img = Image.open(io.BytesIO(photo_bytes))
-        img_array = np.array(img)
-
-        reader = easyocr.Reader(['en'], gpu=False)
-        results = reader.readtext(img_array, detail=0)
-        full_text = " ".join(results)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to read image: {e}")
-        return
-
-    zips = list(dict.fromkeys(re.findall(r'\b\d{5}\b', full_text)))
-    if not zips:
-        await update.message.reply_text("⚠️ No ZIP codes found in that image.")
-        return
-    if len(zips) > 20:
-        await update.message.reply_text(f"⚠️ Found {len(zips)} ZIPs — showing first 20.")
-        zips = zips[:20]
-
-    await update.message.reply_text(f"✅ Found {len(zips)} ZIP(s): {' '.join(zips)}\n\n🔍 Looking up...")
-    await update.message.reply_text("\n\n".join(get_median_income(z) for z in zips), parse_mode="Markdown")
+    await update.message.reply_text(
+        "📸 Screenshot reading is temporarily unavailable.\n\nPlease type your ZIP codes manually instead.\n\nExample: `90210 10001 30301`",
+        parse_mode="Markdown"
+    )
 
 # ── Text message handler ──────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
