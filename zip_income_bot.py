@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Telegram bot — ZIP code median income lookup with crypto payment gate.
+ZIP Income Bot — Full featured with:
+- Multi-data per ZIP (income, population, home value, poverty, unemployment)
+- ZIP history per user
+- Bulk ZIP comparison with ranking
+- Affiliate system (1 free day per referral who buys 3+ days)
+- Referral tracking
+- Revenue dashboard
+- Auto-DM new users with 1-hour free key (rate limited to prevent abuse)
+- ETH/BTC/LTC payment verification
 
-Plans:
-  1 day  = $1
-  3 days = $3
-  7 days = $5
-
-Accepted crypto: ETH, BTC, LTC
-
-Env vars required:
-  TELEGRAM_TOKEN    - from @BotFather
-  CENSUS_API_KEY    - from api.census.gov
-  ETHERSCAN_API_KEY - from etherscan.io (free)
-  ADMIN_USER_ID     - your Telegram user ID (gets free access)
+Env vars:
+  TELEGRAM_TOKEN, CENSUS_API_KEY, ETHERSCAN_API_KEY, ADMIN_USER_ID, DB_PATH
 """
 
 import os, json, logging, requests, secrets, string, re
@@ -29,6 +27,7 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 CENSUS_API_KEY    = os.getenv("CENSUS_API_KEY", "")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 ADMIN_USER_ID     = os.getenv("ADMIN_USER_ID", "")
+DB_FILE           = os.getenv("DB_PATH", "/data/subscribers.json")
 
 WALLETS = {
     "ETH": "0xa00dbAF96a1bC5fa13868E2876B6e8303CeCd11D",
@@ -37,23 +36,19 @@ WALLETS = {
 }
 
 PLANS = {
-    "1day": {"days": 1, "usd": 1.00, "label": "1 Day — $1"},
-    "3day": {"days": 3, "usd": 3.00, "label": "3 Days — $3"},
-    "7day": {"days": 7, "usd": 5.00, "label": "7 Days — $5"},
+    "1day": {"days": 1,  "usd": 1.00, "label": "1 Day — $1"},
+    "3day": {"days": 3,  "usd": 3.00, "label": "3 Days — $3"},
+    "7day": {"days": 7,  "usd": 5.00, "label": "7 Days — $5"},
 }
 
-DB_FILE = os.getenv("DB_PATH", "/data/subscribers.json")
+WELCOME_KEY_MINUTES = 60  # free key duration for new users
+MAX_HISTORY = 20
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Make sure data directory exists
 os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def now_utc():
-    return datetime.now(timezone.utc)
-
+# ── DB ────────────────────────────────────────────────────────────────────────
 def load_db():
     if os.path.exists(DB_FILE):
         with open(DB_FILE) as f:
@@ -62,7 +57,10 @@ def load_db():
 
 def save_db(db):
     with open(DB_FILE, "w") as f:
-        json.dump(db, f)
+        json.dump(db, f, indent=2)
+
+def now_utc():
+    return datetime.now(timezone.utc)
 
 def is_admin(user_id: str) -> bool:
     return bool(ADMIN_USER_ID) and str(user_id) == str(ADMIN_USER_ID)
@@ -81,7 +79,7 @@ def is_subscribed(user_id: str) -> bool:
     except Exception:
         return False
 
-def add_subscription(user_id: str, days: int):
+def add_subscription(user_id: str, days: float):
     db = load_db()
     base = now_utc()
     if user_id in db:
@@ -94,12 +92,14 @@ def add_subscription(user_id: str, days: int):
         except Exception:
             pass
     expiry = base + timedelta(days=days)
-    db[user_id] = {"expiry": expiry.isoformat()}
+    if user_id not in db:
+        db[user_id] = {}
+    db[user_id]["expiry"] = expiry.isoformat()
     save_db(db)
 
 def get_expiry(user_id: str) -> str:
     if is_admin(user_id):
-        return "∞ (Admin — free forever)"
+        return "∞ (Admin)"
     db = load_db()
     if user_id not in db:
         return "No subscription"
@@ -116,17 +116,121 @@ def get_expiry(user_id: str) -> str:
 def track_user(user_id: str, username: str = "", first_name: str = ""):
     db = load_db()
     users = db.get("_users", {})
+    is_new = user_id not in users
     users[user_id] = {
         "username": username,
         "first_name": first_name,
-        "last_seen": now_utc().isoformat()
+        "last_seen": now_utc().isoformat(),
+        "joined": users.get(user_id, {}).get("joined", now_utc().isoformat())
     }
     db["_users"] = users
     save_db(db)
+    return is_new
 
 def get_all_user_ids() -> list:
     db = load_db()
     return list(db.get("_users", {}).keys())
+
+def add_zip_history(user_id: str, zip_code: str):
+    db = load_db()
+    if user_id not in db:
+        db[user_id] = {}
+    history = db[user_id].get("history", [])
+    if zip_code in history:
+        history.remove(zip_code)
+    history.insert(0, zip_code)
+    db[user_id]["history"] = history[:MAX_HISTORY]
+    save_db(db)
+
+def get_zip_history(user_id: str) -> list:
+    db = load_db()
+    return db.get(user_id, {}).get("history", [])
+
+# ── Affiliate system ──────────────────────────────────────────────────────────
+def get_referral_code(user_id: str) -> str:
+    db = load_db()
+    refs = db.get("_referrals", {})
+    if user_id not in refs:
+        code = "REF" + secrets.token_hex(4).upper()
+        refs[user_id] = {"code": code, "referred": [], "days_earned": 0}
+        db["_referrals"] = refs
+        save_db(db)
+    return refs[user_id]["code"]
+
+def get_user_by_ref_code(code: str):
+    db = load_db()
+    refs = db.get("_referrals", {})
+    for uid, data in refs.items():
+        if data.get("code") == code.upper():
+            return uid
+    return None
+
+def process_referral(referrer_id: str, days_purchased: int):
+    """Give referrer 1 free day when someone buys 3+ days."""
+    if days_purchased < 3:
+        return False
+    db = load_db()
+    refs = db.get("_referrals", {})
+    if referrer_id not in refs:
+        return False
+    refs[referrer_id]["days_earned"] = refs[referrer_id].get("days_earned", 0) + 1
+    db["_referrals"] = refs
+    save_db(db)
+    add_subscription(referrer_id, 1)
+    return True
+
+def record_referral(referrer_id: str, new_user_id: str):
+    db = load_db()
+    refs = db.get("_referrals", {})
+    if referrer_id in refs:
+        referred = refs[referrer_id].get("referred", [])
+        if new_user_id not in referred:
+            referred.append(new_user_id)
+            refs[referrer_id]["referred"] = referred
+            db["_referrals"] = refs
+            save_db(db)
+
+# ── Revenue tracking ──────────────────────────────────────────────────────────
+def record_payment(user_id: str, plan_key: str, coin: str, usd: float, tx_hash: str):
+    db = load_db()
+    payments = db.get("_payments", [])
+    payments.append({
+        "user_id": user_id,
+        "plan": plan_key,
+        "coin": coin,
+        "usd": usd,
+        "tx": tx_hash,
+        "time": now_utc().isoformat()
+    })
+    db["_payments"] = payments
+    save_db(db)
+
+# ── Welcome key (anti-abuse) ──────────────────────────────────────────────────
+def should_send_welcome_key(user_id: str) -> bool:
+    """Only send welcome key to genuinely new users — check account age via Telegram isn't possible,
+    so we rate-limit: one welcome key per user_id ever, and max 20/day globally."""
+    db = load_db()
+    welcomed = db.get("_welcomed", {})
+    if user_id in welcomed:
+        return False
+    # Global daily limit
+    today = now_utc().strftime("%Y-%m-%d")
+    daily = db.get("_welcome_daily", {})
+    count = daily.get(today, 0)
+    if count >= 20:
+        return False
+    return True
+
+def mark_welcomed(user_id: str):
+    db = load_db()
+    welcomed = db.get("_welcomed", {})
+    welcomed[user_id] = now_utc().isoformat()
+    db["_welcomed"] = welcomed
+    today = now_utc().strftime("%Y-%m-%d")
+    daily = db.get("_welcome_daily", {})
+    daily[today] = daily.get(today, 0) + 1
+    db["_welcome_daily"] = daily
+    save_db(db)
 
 # ── Crypto helpers ────────────────────────────────────────────────────────────
 def get_crypto_price(coin: str) -> float:
@@ -134,8 +238,7 @@ def get_crypto_price(coin: str) -> float:
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": ids[coin], "vs_currencies": "usd"},
-            timeout=10
+            params={"ids": ids[coin], "vs_currencies": "usd"}, timeout=10
         )
         return float(r.json()[ids[coin]]["usd"])
     except Exception:
@@ -155,64 +258,122 @@ def verify_eth_tx(tx_hash: str, expected_eth: float) -> tuple:
         }, timeout=10)
         tx = r.json().get("result")
         if not tx:
-            return False, "Transaction not found. Make sure it's confirmed on Ethereum mainnet."
+            return False, "Transaction not found."
         if (tx.get("to") or "").lower() != WALLETS["ETH"].lower():
-            return False, "Transaction was not sent to the correct ETH wallet."
+            return False, "Transaction not sent to correct ETH wallet."
         value_eth = int(tx.get("value", "0x0"), 16) / 1e18
         if value_eth < expected_eth * 0.95:
-            return False, f"Amount too low. Received {value_eth:.6f} ETH, expected ~{expected_eth:.6f} ETH."
+            return False, f"Amount too low. Got {value_eth:.6f} ETH, need ~{expected_eth:.6f} ETH."
         if not tx.get("blockNumber"):
-            return False, "Transaction is still pending. Wait for confirmation and try again."
-        return True, f"Verified! Received {value_eth:.6f} ETH ✅"
+            return False, "Still pending. Wait for confirmation."
+        return True, f"Verified! {value_eth:.6f} ETH ✅"
     except Exception as e:
-        return False, f"Verification error: {e}"
+        return False, f"Error: {e}"
 
-def verify_btc_ltc_tx(tx_hash: str, coin: str, expected_amount: float) -> tuple:
+def verify_btc_ltc_tx(tx_hash: str, coin: str, expected: float) -> tuple:
     chain = "bitcoin" if coin == "BTC" else "litecoin"
     wallet = WALLETS[coin].lower()
     try:
-        r = requests.get(
-            f"https://api.blockchair.com/{chain}/dashboards/transaction/{tx_hash}",
-            timeout=15
-        )
+        r = requests.get(f"https://api.blockchair.com/{chain}/dashboards/transaction/{tx_hash}", timeout=15)
         data = r.json().get("data", {})
         if not data or tx_hash not in data:
-            return False, "Transaction not found. Make sure it's confirmed and try again."
+            return False, "Transaction not found."
         tx_data = data[tx_hash]
         if not tx_data.get("transaction", {}).get("block_id"):
-            return False, "Transaction is still pending. Wait for at least 1 confirmation."
-        received = sum(
-            o.get("value", 0) for o in tx_data.get("outputs", [])
-            if o.get("recipient", "").lower() == wallet
-        )
-        received_coin = received / 1e8
-        if received_coin < expected_amount * 0.95:
-            return False, f"Amount too low. Received {received_coin:.8f} {coin}, expected ~{expected_amount:.8f} {coin}."
-        return True, f"Verified! Received {received_coin:.8f} {coin} ✅"
+            return False, "Still pending. Wait for confirmation."
+        received = sum(o.get("value", 0) for o in tx_data.get("outputs", [])
+                      if o.get("recipient", "").lower() == wallet) / 1e8
+        if received < expected * 0.95:
+            return False, f"Amount too low. Got {received:.8f} {coin}, need ~{expected:.8f}."
+        return True, f"Verified! {received:.8f} {coin} ✅"
     except Exception as e:
-        return False, f"Verification error: {e}"
+        return False, f"Error: {e}"
 
-# ── Census lookup ─────────────────────────────────────────────────────────────
-def get_median_income(zip_code: str) -> str:
-    params = {"get": "B19013_001E,NAME", "for": f"zip code tabulation area:{zip_code}"}
+# ── Census data ───────────────────────────────────────────────────────────────
+def get_zip_data(zip_code: str) -> dict:
+    """Fetch multiple data points for a ZIP code."""
+    variables = {
+        "B19013_001E": "median_income",
+        "B01003_001E": "population",
+        "B25077_001E": "median_home_value",
+        "B17001_002E": "poverty_count",
+        "B01003_001E": "population",
+        "NAME": "name",
+    }
+    var_string = "B19013_001E,B01003_001E,B25077_001E,B17001_002E,B23025_005E,NAME"
+    params = {
+        "get": var_string,
+        "for": f"zip code tabulation area:{zip_code}",
+    }
     if CENSUS_API_KEY:
         params["key"] = CENSUS_API_KEY
     try:
         r = requests.get("https://api.census.gov/data/2022/acs/acs5", params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
+        if len(data) < 2:
+            return {"error": f"No data for ZIP {zip_code}"}
+        headers = data[0]
+        values = data[1]
+        result = dict(zip(headers, values))
+        return result
     except Exception as e:
-        return f"❌ Census lookup failed: {e}"
-    if len(data) < 2:
-        return f"❌ No data found for ZIP {zip_code}."
-    income_raw, name = data[1][0], data[1][1]
-    if income_raw in (None, "-666666666", "-999999999"):
-        return f"⚠️ Data not available for ZIP {zip_code}."
+        return {"error": str(e)}
+
+def format_zip_report(zip_code: str, data: dict) -> str:
+    if "error" in data:
+        return f"❌ ZIP {zip_code}: {data['error']}"
+
+    def fmt_int(val, prefix="", suffix=""):
+        try:
+            v = int(val)
+            if v < 0:
+                return "N/A"
+            return f"{prefix}{v:,}{suffix}"
+        except Exception:
+            return "N/A"
+
+    name = data.get("NAME", zip_code)
+    income = fmt_int(data.get("B19013_001E"), "$")
+    population = fmt_int(data.get("B01003_001E"))
+    home_value = fmt_int(data.get("B25077_001E"), "$")
+    poverty = data.get("B17001_002E", "-1")
+    unemployed = data.get("B23025_005E", "-1")
+
+    # Poverty rate
+    try:
+        pov_rate = (int(poverty) / int(data.get("B01003_001E", 1))) * 100
+        poverty_str = f"{pov_rate:.1f}%"
+    except Exception:
+        poverty_str = "N/A"
+
+    # Unemployment
+    try:
+        unemp = int(unemployed)
+        unemp_str = f"{unemp:,}" if unemp >= 0 else "N/A"
+    except Exception:
+        unemp_str = "N/A"
+
     return (
         f"📍 *{name}*\n"
-        f"💰 Median Household Income: *${int(income_raw):,.0f}*\n"
-        f"_(Source: US Census ACS 5-Year Estimates, 2022)_"
+        f"💰 Median Household Income: *{income}*\n"
+        f"🏠 Median Home Value: *{home_value}*\n"
+        f"👥 Population: *{population}*\n"
+        f"📉 Poverty Rate: *{poverty_str}*\n"
+        f"💼 Unemployed: *{unemp_str}*\n"
+        f"_(US Census ACS 5-Year, 2022)_"
     )
+
+def get_median_income(zip_code: str) -> str:
+    data = get_zip_data(zip_code)
+    return format_zip_report(zip_code, data)
+
+def get_income_value(zip_code: str) -> int:
+    data = get_zip_data(zip_code)
+    try:
+        return int(data.get("B19013_001E", -1))
+    except Exception:
+        return -1
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def plan_keyboard():
@@ -234,52 +395,79 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     first_name = update.effective_user.first_name or "there"
     username = update.effective_user.username or ""
-    track_user(user_id, username, first_name)
+    is_new = track_user(user_id, username, first_name)
+
+    # Handle referral code from deep link: /start REFxxxxxx
+    ref_code = context.args[0] if context.args else None
+    if ref_code and ref_code.startswith("REF"):
+        referrer_id = get_user_by_ref_code(ref_code)
+        if referrer_id and referrer_id != user_id:
+            db = load_db()
+            if db.get(user_id, {}).get("referred_by") is None:
+                if user_id not in db:
+                    db[user_id] = {}
+                db[user_id]["referred_by"] = referrer_id
+                save_db(db)
+                record_referral(referrer_id, user_id)
+
+    # Auto welcome key for new users (anti-abuse limited)
+    if is_new and should_send_welcome_key(user_id):
+        mark_welcomed(user_id)
+        add_subscription(user_id, WELCOME_KEY_MINUTES / 1440)  # minutes to days
+        await update.message.reply_text(
+            f"👋 Welcome *{first_name}*! 🎉\n\n"
+            f"You've been given a *free 1-hour trial* to try out the bot!\n\n"
+            f"Send any ZIP code to get started. Upgrade anytime with /pay",
+            parse_mode="Markdown"
+        )
+        return
 
     if is_subscribed(user_id):
         expiry = get_expiry(user_id)
         await update.message.reply_text(
             f"👋 Welcome back, *{first_name}*!\n\n"
             f"✅ Subscription active until *{expiry}*\n\n"
-            f"Send any 5-digit US ZIP code to look up median household income.\n"
-            f"Bulk: `90210 10001 30301`\n"
-            f"Or send a *screenshot* with ZIP codes!\n\n"
-            f"*Commands:*\n/pay — subscribe or renew\n/status — check subscription\n/help — guide",
+            f"*What I can do:*\n"
+            f"• Send a ZIP: `90210`\n"
+            f"• Bulk ZIPs: `90210 10001 30301`\n"
+            f"• /compare — compare ZIPs side by side\n"
+            f"• /history — your recent lookups\n"
+            f"• /refer — earn free days by referring friends\n\n"
+            f"*Commands:*\n/pay /status /history /compare /refer /help",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
             f"👋 Hey *{first_name}*, welcome to *ZIP Income Bot*!\n\n"
-            f"📊 *What this bot does:*\n"
-            f"Send any US ZIP code and instantly get the median household income — powered by US Census data.\n\n"
-            f"*Example:* Send `90210` → Beverly Hills income data\n"
-            f"Send a *screenshot* of ZIPs and the bot reads them automatically!\n\n"
+            f"📊 Get median income, home values, population, poverty rate & more for any US ZIP code.\n\n"
+            f"*Example:* `90210` → Full Beverly Hills data\n"
+            f"Bulk: `90210 10001 30301` → Compare multiple ZIPs\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💳 *Plans:*\n"
             f"📅 1 Day — $1\n📅 3 Days — $3\n📅 7 Days — $5\n\n"
             f"Pay with *ETH, BTC, or LTC*\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"*Commands:*\n/pay — subscribe\n/status — check subscription\n/help — guide",
+            f"🤝 Refer friends & earn free days! /refer",
             parse_mode="Markdown",
             reply_markup=plan_keyboard()
         )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *ZIP Income Bot — Help Guide*\n\n"
-        "*Plans:*\n📅 1 Day — $1\n📅 3 Days — $3\n📅 7 Days — $5\n\n"
-        "*Accepted crypto:* ETH, BTC, LTC\n\n"
-        "*How to use:*\n"
-        "1. Use /pay to pick a plan and coin\n"
-        "2. Send the exact crypto amount shown\n"
-        "3. Paste your transaction hash to verify\n"
-        "4. Start looking up ZIP codes!\n\n"
-        "*ZIP lookups:*\n"
-        "• Single: `90210`\n"
-        "• Bulk: `90210 10001 30301`\n"
-        "• Screenshot: send a photo with ZIP codes\n\n"
-        "• Redeem a free key by typing it in chat\n"
-        "• /status — check expiry",
+        "📖 *ZIP Income Bot — Commands*\n\n"
+        "/pay — subscribe\n"
+        "/status — check expiry\n"
+        "/history — your last 20 ZIP lookups\n"
+        "/compare 90210 10001 — compare two ZIPs\n"
+        "/refer — get your referral link\n"
+        "/help — this menu\n\n"
+        "*Data shown per ZIP:*\n"
+        "• Median household income\n"
+        "• Median home value\n"
+        "• Population\n"
+        "• Poverty rate\n"
+        "• Unemployment count\n\n"
+        "*Referral program:*\n"
+        "Share your link → friend buys 3+ days → you get 1 free day!",
         parse_mode="Markdown",
         reply_markup=plan_keyboard()
     )
@@ -287,9 +475,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if is_subscribed(user_id):
-        expiry = get_expiry(user_id)
         await update.message.reply_text(
-            f"✅ You're subscribed until *{expiry}*.\n\nPick a plan to extend:",
+            f"✅ Subscribed until *{get_expiry(user_id)}*\n\nExtend your subscription:",
             parse_mode="Markdown", reply_markup=plan_keyboard()
         )
         return
@@ -298,9 +485,80 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if is_subscribed(user_id):
-        await update.message.reply_text(f"✅ Active subscription until *{get_expiry(user_id)}*.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Active until *{get_expiry(user_id)}*.", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ No active subscription.", reply_markup=plan_keyboard())
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_subscribed(user_id):
+        await update.message.reply_text("🔒 Subscribe to use this feature.", reply_markup=plan_keyboard())
+        return
+    h = get_zip_history(user_id)
+    if not h:
+        await update.message.reply_text("No ZIP history yet. Send some ZIP codes to get started!")
+        return
+    await update.message.reply_text(
+        f"🕐 *Your last {len(h)} ZIP lookups:*\n\n" + "\n".join([f"`{z}`" for z in h]),
+        parse_mode="Markdown"
+    )
+
+async def compare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_subscribed(user_id):
+        await update.message.reply_text("🔒 Subscribe to use this feature.", reply_markup=plan_keyboard())
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Usage: `/compare 90210 10001`", parse_mode="Markdown")
+        return
+    zips = [z for z in context.args if z.isdigit() and len(z) == 5][:5]
+    if len(zips) < 2:
+        await update.message.reply_text("Please provide at least 2 valid ZIP codes.")
+        return
+    await update.message.reply_text(f"🔍 Comparing {len(zips)} ZIP codes...")
+    results = []
+    income_map = {}
+    for z in zips:
+        data = get_zip_data(z)
+        results.append(format_zip_report(z, data))
+        try:
+            income_map[z] = int(data.get("B19013_001E", -1))
+        except Exception:
+            income_map[z] = -1
+        add_zip_history(user_id, z)
+
+    # Rank by income
+    ranked = sorted([(z, v) for z, v in income_map.items() if v > 0], key=lambda x: x[1], reverse=True)
+    ranking = "\n".join([f"{i+1}. `{z}` — ${v:,}" for i, (z, v) in enumerate(ranked)])
+
+    await update.message.reply_text("\n\n".join(results), parse_mode="Markdown")
+    if ranked:
+        await update.message.reply_text(
+            f"🏆 *Income Ranking (highest to lowest):*\n\n{ranking}",
+            parse_mode="Markdown"
+        )
+
+async def refer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    code = get_referral_code(user_id)
+    bot_username = (await context.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={code}"
+    db = load_db()
+    refs = db.get("_referrals", {}).get(user_id, {})
+    referred_count = len(refs.get("referred", []))
+    days_earned = refs.get("days_earned", 0)
+    await update.message.reply_text(
+        f"🤝 *Your Referral Link:*\n\n`{link}`\n\n"
+        f"Share this link with friends!\n\n"
+        f"*How it works:*\n"
+        f"• Friend clicks your link & starts the bot\n"
+        f"• They buy a *3-day or longer* plan\n"
+        f"• You automatically get *+1 free day* added!\n\n"
+        f"📊 *Your stats:*\n"
+        f"👥 Total referred: *{referred_count}*\n"
+        f"🎁 Days earned: *{days_earned}*",
+        parse_mode="Markdown"
+    )
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -314,7 +572,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["plan"] = plan_key
         await query.message.reply_text(
-            f"📅 *{plan['label']}* selected.\n\nChoose your payment coin:",
+            f"📅 *{plan['label']}* selected.\n\nChoose your coin:",
             parse_mode="Markdown", reply_markup=coin_keyboard(plan_key)
         )
 
@@ -331,98 +589,136 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💳 *Payment Instructions*\n\n"
             f"Plan: *{plan['label']}*\nCoin: *{coin}*\n\n"
             f"Send exactly:\n```\n{amount} {coin}\n```\n"
-            f"To this wallet:\n```\n{WALLETS[coin]}\n```\n"
+            f"To:\n```\n{WALLETS[coin]}\n```\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"After sending, paste your *transaction hash* here to verify.\n"
-            f"⏳ Amount based on live price — run /pay again if you wait too long.",
+            f"After sending, paste your *transaction hash* here.",
             parse_mode="Markdown"
         )
-
     elif data == "pay":
         await query.message.reply_text("💳 *Choose a plan:*", parse_mode="Markdown", reply_markup=plan_keyboard())
 
-# ── Screenshot ZIP extraction via EasyOCR ────────────────────────────────────
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_subscribed(user_id):
-        await update.message.reply_text(
-            "🔒 *Access required!*\n\nPick a plan to get started.",
-            parse_mode="Markdown", reply_markup=plan_keyboard()
-        )
+        await update.message.reply_text("🔒 Subscribe to use this feature.", reply_markup=plan_keyboard())
         return
     await update.message.reply_text(
-        "📸 Screenshot reading is temporarily unavailable.\n\nPlease type your ZIP codes manually instead.\n\nExample: `90210 10001 30301`",
+        "📸 Screenshot reading is temporarily unavailable.\n\nType your ZIP codes instead: `90210 10001 30301`",
         parse_mode="Markdown"
     )
 
-# ── Text message handler ──────────────────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     track_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "")
     text = update.message.text.strip()
 
-    # ETH tx hash (0x + 64 hex chars)
+    # ETH tx hash
     if text.startswith("0x") and len(text) == 66:
         pending_plan = context.user_data.get("pending_plan", "7day")
         pending_amount = context.user_data.get("pending_amount") or usd_to_crypto(PLANS[pending_plan]["usd"], "ETH")
         await update.message.reply_text("🔍 Verifying on Etherscan...")
         ok, msg = verify_eth_tx(text, pending_amount)
         if ok:
-            add_subscription(user_id, PLANS[pending_plan]["days"])
+            plan = PLANS[pending_plan]
+            add_subscription(user_id, plan["days"])
+            record_payment(user_id, pending_plan, "ETH", plan["usd"], text)
+            # Process referral
+            db = load_db()
+            referrer = db.get(user_id, {}).get("referred_by")
+            if referrer and process_referral(referrer, plan["days"]):
+                try:
+                    ref_info = db.get("_users", {}).get(referrer, {})
+                    ref_name = ref_info.get("first_name", "Your referrer")
+                    await context.bot.send_message(
+                        chat_id=int(referrer),
+                        text=f"🎉 Your referral just subscribed! You've earned *+1 free day!*\nNew expiry: *{get_expiry(referrer)}*",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
             await update.message.reply_text(
-                f"🎉 *Payment confirmed!*\n\n{msg}\n\n✅ Subscription active until *{get_expiry(user_id)}*\n\nSend any ZIP code to get started!",
+                f"🎉 *Payment confirmed!*\n\n{msg}\n\n✅ Active until *{get_expiry(user_id)}*\n\nSend any ZIP code!",
                 parse_mode="Markdown"
             )
         else:
-            await update.message.reply_text(f"❌ *Verification failed:*\n{msg}", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ *Failed:*\n{msg}", parse_mode="Markdown")
         return
 
-    # BTC/LTC tx hash (64 hex chars)
+    # BTC/LTC tx hash
     if len(text) == 64 and all(c in "0123456789abcdefABCDEF" for c in text):
         pending_coin = context.user_data.get("pending_coin")
         pending_plan = context.user_data.get("pending_plan", "7day")
         pending_amount = context.user_data.get("pending_amount")
         if not pending_coin or pending_coin not in ("BTC", "LTC"):
-            await update.message.reply_text("⚠️ Please use /pay first to select your plan and coin, then paste your tx hash.")
+            await update.message.reply_text("⚠️ Use /pay first to select plan and coin.")
             return
         if not pending_amount:
             pending_amount = usd_to_crypto(PLANS[pending_plan]["usd"], pending_coin)
-        await update.message.reply_text(f"🔍 Verifying {pending_coin} transaction on Blockchair...")
+        await update.message.reply_text(f"🔍 Verifying {pending_coin} on Blockchair...")
         ok, msg = verify_btc_ltc_tx(text, pending_coin, pending_amount)
         if ok:
-            add_subscription(user_id, PLANS[pending_plan]["days"])
+            plan = PLANS[pending_plan]
+            add_subscription(user_id, plan["days"])
+            record_payment(user_id, pending_plan, pending_coin, plan["usd"], text)
+            db = load_db()
+            referrer = db.get(user_id, {}).get("referred_by")
+            if referrer and process_referral(referrer, plan["days"]):
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(referrer),
+                        text=f"🎉 Your referral just subscribed! You earned *+1 free day!*\nNew expiry: *{get_expiry(referrer)}*",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
             await update.message.reply_text(
-                f"🎉 *Payment confirmed!*\n\n{msg}\n\n✅ Subscription active until *{get_expiry(user_id)}*\n\nSend any ZIP code to get started!",
+                f"🎉 *Payment confirmed!*\n\n{msg}\n\n✅ Active until *{get_expiry(user_id)}*\n\nSend any ZIP code!",
                 parse_mode="Markdown"
             )
         else:
-            await update.message.reply_text(f"❌ *Verification failed:*\n{msg}", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ *Failed:*\n{msg}", parse_mode="Markdown")
         return
 
-    # ZIP lookup — single or bulk
+    # ZIP lookups
     tokens = [t.strip().strip(",") for t in text.replace(",", " ").replace("\n", " ").split()]
     zips = [t for t in tokens if t.isdigit() and len(t) == 5]
     if zips:
         if not is_subscribed(user_id):
-            await update.message.reply_text(
-                "🔒 *Access required!*\n\nPick a plan to get started.",
-                parse_mode="Markdown", reply_markup=plan_keyboard()
-            )
+            await update.message.reply_text("🔒 *Access required!*", parse_mode="Markdown", reply_markup=plan_keyboard())
             return
         if len(zips) > 20:
-            await update.message.reply_text("⚠️ Max 20 ZIPs at a time. Showing first 20.")
+            await update.message.reply_text("⚠️ Max 20 ZIPs. Showing first 20.")
             zips = zips[:20]
+
         await update.message.reply_text(f"🔍 Looking up {len(zips)} ZIP code(s)...")
-        await update.message.reply_text("\n\n".join(get_median_income(z) for z in zips), parse_mode="Markdown")
+        results = []
+        income_map = {}
+        for z in zips:
+            data = get_zip_data(z)
+            results.append(format_zip_report(z, data))
+            add_zip_history(user_id, z)
+            try:
+                income_map[z] = int(data.get("B19013_001E", -1))
+            except Exception:
+                income_map[z] = -1
+
+        await update.message.reply_text("\n\n".join(results), parse_mode="Markdown")
+
+        # Show ranking if bulk
+        if len(zips) > 1:
+            ranked = sorted([(z, v) for z, v in income_map.items() if v > 0], key=lambda x: x[1], reverse=True)
+            if ranked:
+                ranking = "\n".join([f"{i+1}. `{z}` — ${v:,}" for i, (z, v) in enumerate(ranked)])
+                await update.message.reply_text(f"🏆 *Ranked by Income:*\n\n{ranking}", parse_mode="Markdown")
         return
 
-    # Redeem a free key
+    # Redeem key
     if len(text) == 16 and text.isalnum():
         db = load_db()
         keys = db.get("_keys", {})
         if text in keys:
             if keys[text].get("used"):
-                await update.message.reply_text("❌ That key has already been used.")
+                await update.message.reply_text("❌ Key already used.")
             else:
                 days = keys[text].get("days", 1)
                 keys[text]["used"] = True
@@ -432,15 +728,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_db(db)
                 add_subscription(user_id, days)
                 await update.message.reply_text(
-                    f"🎉 *Key redeemed!*\n\n✅ Access granted until *{get_expiry(user_id)}*\n\nSend any ZIP code to get started!",
+                    f"🎉 *Key redeemed!*\n\n✅ Access until *{get_expiry(user_id)}*\n\nSend any ZIP code!",
                     parse_mode="Markdown"
                 )
         else:
-            await update.message.reply_text("❌ Invalid key. Check it and try again.")
+            await update.message.reply_text("❌ Invalid key.")
         return
 
     await update.message.reply_text(
-        "Send one or more 5-digit ZIP codes or a screenshot.\n\nExample: `90210 10001 30301`\n\nNeed access? Use /pay",
+        "Send ZIP codes to look up data.\n\nExample: `90210 10001 30301`\n\nNeed access? /pay\nEarn free days? /refer",
         parse_mode="Markdown"
     )
 
@@ -450,7 +746,7 @@ def generate_key() -> str:
 
 async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
-        await update.message.reply_text("❌ Admin only command.")
+        await update.message.reply_text("❌ Admin only.")
         return
     days = int(context.args[0]) if context.args else 1
     qty = min(20, int(context.args[1])) if len(context.args) >= 2 else 1
@@ -459,43 +755,36 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_keys = []
     for _ in range(qty):
         k = generate_key()
-        keys[k] = {
-            "days": days,
-            "used": False,
-            "redeemed_by": None,
-            "created": now_utc().isoformat()
-            # No expiry — key stays valid until someone redeems it
-        }
+        keys[k] = {"days": days, "used": False, "created": now_utc().isoformat()}
         new_keys.append(k)
     db["_keys"] = keys
     save_db(db)
     key_list = "\n".join([f"`{k}`" for k in new_keys])
     await update.message.reply_text(
-        f"🔑 *Generated {qty} key(s) — {days} day(s) each:*\n\n{key_list}\n\n"
-        f"Keys never expire until redeemed. Each is single-use.",
+        f"🔑 *{qty} key(s) — {days} day(s):*\n\n{key_list}\n\nNever expire until redeemed.",
         parse_mode="Markdown"
     )
 
 async def listkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
-        await update.message.reply_text("❌ Admin only command.")
+        await update.message.reply_text("❌ Admin only.")
         return
     db = load_db()
     keys = db.get("_keys", {})
     if not keys:
-        await update.message.reply_text("No keys generated yet.")
+        await update.message.reply_text("No keys yet.")
         return
     unused = [k for k, v in keys.items() if not v.get("used")]
     used = [k for k, v in keys.items() if v.get("used")]
     msg = f"🔑 *Keys*\n\n✅ Unused ({len(unused)}):\n"
     msg += "\n".join([f"`{k}` ({keys[k]['days']}d)" for k in unused]) or "None"
     msg += f"\n\n❌ Used ({len(used)}):\n"
-    msg += "\n".join([f"`{k}`" for k in used]) or "None"
+    msg += "\n".join([f"`{k}` → {keys[k].get('redeemed_by','?')}" for k in used]) or "None"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
-        await update.message.reply_text("❌ Admin only command.")
+        await update.message.reply_text("❌ Admin only.")
         return
     db = load_db()
     users = db.get("_users", {})
@@ -513,7 +802,7 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if expiry.tzinfo is None:
                     expiry = expiry.replace(tzinfo=timezone.utc)
                 if now_utc() < expiry:
-                    expiry_str = f"✅ until {expiry.strftime('%m/%d')}"
+                    expiry_str = f"✅ {expiry.strftime('%m/%d')}"
                     active += 1
                 else:
                     expiry_str = "❌ expired"
@@ -521,9 +810,9 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         uname = f"@{info['username']}" if info.get("username") else f"ID:{uid}"
         last = (info.get("last_seen") or "")[:10]
-        lines.append(f"{uname} ({info.get('first_name','')}) — {expiry_str} — last seen {last}")
+        lines.append(f"{uname} ({info.get('first_name','')}) — {expiry_str} — {last}")
 
-    header = f"👥 *Users: {len(users)} total, {active} active*\n\n"
+    header = f"👥 *{len(users)} users, {active} active*\n\n"
     chunk = header
     for line in lines:
         if len(chunk) + len(line) > 3800:
@@ -533,12 +822,51 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chunk:
         await update.message.reply_text(chunk, parse_mode="Markdown")
 
+async def revenue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    db = load_db()
+    payments = db.get("_payments", [])
+    if not payments:
+        await update.message.reply_text("No payments recorded yet.")
+        return
+
+    total_usd = sum(p.get("usd", 0) for p in payments)
+    by_coin = {}
+    by_plan = {}
+    for p in payments:
+        coin = p.get("coin", "?")
+        plan = p.get("plan", "?")
+        by_coin[coin] = by_coin.get(coin, 0) + 1
+        by_plan[plan] = by_plan.get(plan, 0) + 1
+
+    coin_breakdown = "\n".join([f"  {c}: {n} payments" for c, n in by_coin.items()])
+    plan_breakdown = "\n".join([f"  {p}: {n} sales" for p, n in by_plan.items()])
+
+    # Last 5 payments
+    recent = payments[-5:][::-1]
+    recent_lines = "\n".join([
+        f"  ${p['usd']} via {p['coin']} ({p['plan']}) — {p['time'][:10]}"
+        for p in recent
+    ])
+
+    await update.message.reply_text(
+        f"💰 *Revenue Dashboard*\n\n"
+        f"💵 Total Revenue: *${total_usd:.2f}*\n"
+        f"📦 Total Payments: *{len(payments)}*\n\n"
+        f"*By Coin:*\n{coin_breakdown}\n\n"
+        f"*By Plan:*\n{plan_breakdown}\n\n"
+        f"*Recent Payments:*\n{recent_lines}",
+        parse_mode="Markdown"
+    )
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(str(update.effective_user.id)):
-        await update.message.reply_text("❌ Admin only command.")
+        await update.message.reply_text("❌ Admin only.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: `/broadcast Your message here`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/broadcast message here`", parse_mode="Markdown")
         return
     message = " ".join(context.args)
     user_ids = get_all_user_ids()
@@ -559,9 +887,13 @@ def main():
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("compare", compare_cmd))
+    app.add_handler(CommandHandler("refer", refer_cmd))
     app.add_handler(CommandHandler("genkey", genkey))
     app.add_handler(CommandHandler("listkeys", listkeys))
     app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("revenue", revenue_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
