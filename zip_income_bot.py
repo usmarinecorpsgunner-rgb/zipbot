@@ -35,7 +35,7 @@ WALLETS = {
     "LTC": "LPATdHDDiQZRhNUp77h8cELLne7Uoqk33Z",
     "BTC": "bc1qd4ga556dsnu468pejrqj6s25erxcztpawszd6s",
 }
-
+DB_FILE = "subscribers.json"
 PLANS = {
     "1day":  {"days": 1, "usd": 1.00, "label": "1 Day — $1"},
     "3day":  {"days": 3, "usd": 3.00, "label": "3 Days — $3"},
