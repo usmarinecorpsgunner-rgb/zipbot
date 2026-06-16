@@ -672,6 +672,49 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(user_id, update.effective_user.username or "", update.effective_user.first_name or "")
     text = update.message.text.strip()
 
+    # Bin creation flow
+    if context.user_data.get("bin_creating"):
+        # Step 1: set title
+        if context.user_data.get("bin_title") is None:
+            context.user_data["bin_title"] = text
+            context.user_data["bin_items"] = []
+            await update.message.reply_text(
+                f"📦 Bin name: *{text}*\n\n"
+                f"Now type your first item and send it.\n"
+                f"Keep adding items one by one.\n\n"
+                f"When you're done, send `done` to save.",
+                parse_mode="Markdown"
+            )
+            return
+        # Step 2: collect items
+        if text.lower() == "done":
+            title = context.user_data["bin_title"]
+            items = context.user_data["bin_items"]
+            if not items:
+                await update.message.reply_text("❌ No items added. Bin not saved. Start over with `/bins new`", parse_mode="Markdown")
+            else:
+                save_user_bin(user_id, title, items)
+                numbered = "\n".join([f"{i+1}. {item}" for i, item in enumerate(items)])
+                await update.message.reply_text(
+                    f"✅ *Bin saved!*\n\n📦 *{title}*\n\n{numbered}\n\n"
+                    f"View it anytime: `/bins view {title}`\n"
+                    f"Add more: `/bins add {title} <item>`",
+                    parse_mode="Markdown"
+                )
+            context.user_data["bin_creating"] = False
+            context.user_data["bin_title"] = None
+            context.user_data["bin_items"] = []
+            return
+        else:
+            context.user_data["bin_items"].append(text)
+            count = len(context.user_data["bin_items"])
+            await update.message.reply_text(
+                f"✅ Item {count} added: *{text}*\n\n"
+                f"Send another item or type `done` to save.",
+                parse_mode="Markdown"
+            )
+            return
+
     # ETH tx hash
     if text.startswith("0x") and len(text) == 66:
         pending_plan = context.user_data.get("pending_plan", "7day")
@@ -816,7 +859,8 @@ async def features_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Send a screenshot — bot reads ZIPs automatically\n\n"
         "📋 *Tools:*\n"
         "• /history — see your last 20 lookups\n"
-        "• /compare 90210 10001 — side by side comparison\n\n"
+        "• /compare 90210 10001 — side by side comparison\n"
+        "• /bins — save ZIP lists and run them anytime\n\n"
         "💳 *Plans:*\n"
         "• 1 Day — $1\n"
         "• 3 Days — $3\n"
@@ -865,7 +909,219 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-# ── Admin commands ────────────────────────────────────────────────────────────
+# ── Bins system ───────────────────────────────────────────────────────────────
+def get_user_bins(user_id: str) -> dict:
+    db = load_db()
+    return db.get(user_id, {}).get("bins", {})
+
+# ── Bins — general info saver ─────────────────────────────────────────────────
+def get_user_bins(user_id: str) -> dict:
+    db = load_db()
+    return db.get(user_id, {}).get("bins", {})
+
+def save_user_bin(user_id: str, title: str, items: list):
+    db = load_db()
+    if user_id not in db:
+        db[user_id] = {}
+    bins = db[user_id].get("bins", {})
+    bins[title] = {"items": items, "created": now_utc().isoformat()}
+    db[user_id]["bins"] = bins
+    save_db(db)
+
+def delete_user_bin(user_id: str, title: str) -> bool:
+    db = load_db()
+    bins = db.get(user_id, {}).get("bins", {})
+    if title in bins:
+        del bins[title]
+        db[user_id]["bins"] = bins
+        save_db(db)
+        return True
+    return False
+
+async def bins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_subscribed(user_id):
+        await update.message.reply_text("🔒 Subscribe to use this feature.", reply_markup=plan_keyboard())
+        return
+
+    bins = get_user_bins(user_id)
+
+    if not context.args:
+        if not bins:
+            await update.message.reply_text(
+                "📦 *Your Bins*\n\nNo saved bins yet!\n\n"
+                "*Commands:*\n"
+                "`/bins new` — create a new bin\n"
+                "`/bins view <title>` — view a bin\n"
+                "`/bins add <title> <item>` — add to existing bin\n"
+                "`/bins delete <title>` — delete a bin\n"
+                "`/bins list` — see all your bins",
+                parse_mode="Markdown"
+            )
+            return
+        lines = [f"📦 *{title}* — {len(data.get('items',[]))} item(s)" for title, data in bins.items()]
+        await update.message.reply_text(
+            f"📦 *Your Bins ({len(bins)}):*\n\n" + "\n".join(lines) + "\n\n"
+            "`/bins view <title>` to open one\n"
+            "`/bins new` to create one",
+            parse_mode="Markdown"
+        )
+        return
+
+    action = context.args[0].lower()
+
+    # /bins new — start creation flow
+    if action == "new":
+        context.user_data["bin_creating"] = True
+        context.user_data["bin_title"] = None
+        context.user_data["bin_items"] = []
+        await update.message.reply_text(
+            "📦 *Create a New Bin*\n\nWhat do you want to name this bin?\n\nExample: `Crowns`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # /bins list
+    if action == "list":
+        if not bins:
+            await update.message.reply_text("No bins saved yet. Use `/bins new` to create one.", parse_mode="Markdown")
+            return
+        lines = [f"📦 *{title}* — {len(data.get('items',[]))} item(s)" for title, data in bins.items()]
+        await update.message.reply_text(
+            f"📦 *Your Bins ({len(bins)}):*\n\n" + "\n".join(lines),
+            parse_mode="Markdown"
+        )
+        return
+
+    # /bins view <title>
+    if action == "view":
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: `/bins view Crowns`", parse_mode="Markdown")
+            return
+        title = " ".join(context.args[1:])
+        if title not in bins:
+            await update.message.reply_text(f"❌ No bin named *{title}*.", parse_mode="Markdown")
+            return
+        items = bins[title].get("items", [])
+        numbered = "\n".join([f"{i+1}. {item}" for i, item in enumerate(items)])
+        await update.message.reply_text(
+            f"📦 *{title}*\n\n{numbered}\n\n"
+            f"Add more: `/bins add {title} <item>`\n"
+            f"Delete: `/bins delete {title}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # /bins add <title> <item>
+    if action == "add":
+        if len(context.args) < 3:
+            await update.message.reply_text("Usage: `/bins add Crowns 123456`", parse_mode="Markdown")
+            return
+        title = context.args[1]
+        item = " ".join(context.args[2:])
+        if title not in bins:
+            await update.message.reply_text(f"❌ No bin named *{title}*. Use `/bins new` to create it.", parse_mode="Markdown")
+            return
+        items = bins[title].get("items", [])
+        items.append(item)
+        save_user_bin(user_id, title, items)
+        await update.message.reply_text(
+            f"✅ Added to *{title}*!\n\n"
+            f"*{title}* now has {len(items)} item(s).\n"
+            f"Add more: `/bins add {title} <item>`\n"
+            f"View: `/bins view {title}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # /bins delete <title>
+    if action == "delete":
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: `/bins delete Crowns`", parse_mode="Markdown")
+            return
+        title = " ".join(context.args[1:])
+        if delete_user_bin(user_id, title):
+            await update.message.reply_text(f"🗑️ Bin *{title}* deleted.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"❌ No bin named *{title}*.", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text(
+        "Commands:\n"
+        "`/bins new` — create\n"
+        "`/bins list` — list all\n"
+        "`/bins view <title>` — view\n"
+        "`/bins add <title> <item>` — add item\n"
+        "`/bins delete <title>` — delete",
+        parse_mode="Markdown"
+    )
+
+
+async def binsearch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/binsearch Crowns`", parse_mode="Markdown")
+        return
+    keyword = " ".join(context.args).lower()
+    db = load_db()
+    users = db.get("_users", {})
+    matches = []
+    for uid, user_info in users.items():
+        user_bins = db.get(uid, {}).get("bins", {})
+        for title, data in user_bins.items():
+            if keyword in title.lower():
+                uname = f"@{user_info['username']}" if user_info.get("username") else f"ID:{uid}"
+                matches.append({
+                    "user": uname, "title": title,
+                    "zips": data.get("items", data.get("zips", [])),
+                    "created": data.get("created", "")[:10]
+                })
+    if not matches:
+        await update.message.reply_text(f"❌ No bins found matching *{keyword}*", parse_mode="Markdown")
+        return
+    header = f"🔍 *\"{keyword}\" — {len(matches)} result(s):*\n\n"
+    chunk = header
+    for m in matches:
+        line = f"👤 {m['user']} — 📦 *{m['title']}*\nZIPs: `{' '.join(m['zips'])}` ({len(m['zips'])}) — {m['created']}\n\n"
+        if len(chunk) + len(line) > 3800:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+            chunk = ""
+        chunk += line
+    if chunk:
+        await update.message.reply_text(chunk.strip(), parse_mode="Markdown")
+
+async def binlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(str(update.effective_user.id)):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    db = load_db()
+    users = db.get("_users", {})
+    all_bins = []
+    for uid, user_info in users.items():
+        user_bins = db.get(uid, {}).get("bins", {})
+        for title, data in user_bins.items():
+            uname = f"@{user_info['username']}" if user_info.get("username") else f"ID:{uid}"
+            all_bins.append({
+                "user": uname, "title": title,
+                "zips": data.get("items", data.get("zips", [])),
+                "created": data.get("created", "")[:10]
+            })
+    if not all_bins:
+        await update.message.reply_text("No bins saved by any users yet.")
+        return
+    header = f"📦 *All Bins ({len(all_bins)} total):*\n\n"
+    chunk = header
+    for b in all_bins:
+        line = f"👤 {b['user']} — 📦 *{b['title']}*\n`{' '.join(b['zips'])}` ({len(b['zips'])} ZIPs) — {b['created']}\n\n"
+        if len(chunk) + len(line) > 3800:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+            chunk = ""
+        chunk += line
+    if chunk:
+        await update.message.reply_text(chunk.strip(), parse_mode="Markdown")
+
 def generate_key() -> str:
     return "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))
 
@@ -1016,6 +1272,9 @@ def main():
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("compare", compare_cmd))
     app.add_handler(CommandHandler("refer", refer_cmd))
+    app.add_handler(CommandHandler("bins", bins_cmd))
+    app.add_handler(CommandHandler("binsearch", binsearch_cmd))
+    app.add_handler(CommandHandler("binlist", binlist_cmd))
     app.add_handler(CommandHandler("features", features_cmd))
     app.add_handler(CommandHandler("redeem", redeem_cmd))
     app.add_handler(CommandHandler("genkey", genkey))
