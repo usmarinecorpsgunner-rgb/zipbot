@@ -36,9 +36,9 @@ WALLETS = {
 }
 
 PLANS = {
-    "1day": {"days": 1,  "usd": 1.00, "label": "1 Day — $1"},
-    "3day": {"days": 3,  "usd": 3.00, "label": "3 Days — $3"},
-    "7day": {"days": 7,  "usd": 5.00, "label": "7 Days — $5"},
+    "1day": {"days": 1,  "usd": 2.00,  "label": "1 Day — $2"},
+    "7day": {"days": 7,  "usd": 7.00,  "label": "7 Days — $7"},
+    "30day": {"days": 30, "usd": 15.00, "label": "30 Days — $15"},
 }
 
 WELCOME_KEY_MINUTES = 60  # free key duration for new users
@@ -378,9 +378,9 @@ def get_income_value(zip_code: str) -> int:
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def plan_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 1 Day — $1",  callback_data="plan_1day")],
-        [InlineKeyboardButton("📅 3 Days — $3", callback_data="plan_3day")],
-        [InlineKeyboardButton("📅 7 Days — $5", callback_data="plan_7day")],
+        [InlineKeyboardButton("📅 1 Day — $2",   callback_data="plan_1day")],
+        [InlineKeyboardButton("📅 7 Days — $7",  callback_data="plan_7day")],
+        [InlineKeyboardButton("📅 30 Days — $15", callback_data="plan_30day")],
     ])
 
 def coin_keyboard(plan_key: str):
@@ -395,7 +395,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     first_name = update.effective_user.first_name or "there"
     username = update.effective_user.username or ""
-    is_new = track_user(user_id, username, first_name)
+    
+    # Check if new BEFORE tracking
+    db = load_db()
+    is_new = user_id not in db.get("_users", {}) and user_id not in db.get("_welcomed", {})
+    
+    track_user(user_id, username, first_name)
 
     # Handle referral code from deep link: /start REFxxxxxx
     ref_code = context.args[0] if context.args else None
@@ -444,7 +449,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Bulk: `90210 10001 30301` → Compare multiple ZIPs\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💳 *Plans:*\n"
-            f"📅 1 Day — $1\n📅 3 Days — $3\n📅 7 Days — $5\n\n"
+            f"📅 1 Day — $2\n📅 7 Days — $7\n📅 30 Days — $15\n\n"
             f"Pay with *ETH, BTC, or LTC*\n\n"
             f"🤝 Refer friends & earn free days! /refer",
             parse_mode="Markdown",
@@ -862,9 +867,9 @@ async def features_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /compare 90210 10001 — side by side comparison\n"
         "• /bins — save ZIP lists and run them anytime\n\n"
         "💳 *Plans:*\n"
-        "• 1 Day — $1\n"
-        "• 3 Days — $3\n"
-        "• 7 Days — $5\n"
+        "• 1 Day — $2\n"
+        "• 7 Days — $7\n"
+        "• 30 Days — $15\n"
         "• Pay with ETH, BTC, LTC, or USDT\n\n"
         "🤝 *Referral program:*\n"
         "• /refer — get your unique link\n"
