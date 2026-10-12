@@ -366,17 +366,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 users_col.update_one({"_id": user_id}, {"$set": {"referred_by": referrer_id}})
                 record_referral(referrer_id, user_id)
 
-    if is_new and should_send_welcome_key(user_id):
-        mark_welcomed(user_id)
-        add_subscription(user_id, WELCOME_KEY_MINUTES / 1440)
-        await update.message.reply_text(
-            f"👋 Welcome *{first_name}*! 🎉\n\n"
-            f"You've been given a *free 1-hour trial*!\n\n"
-            f"Send any ZIP code to get started. Upgrade anytime with /pay",
-            parse_mode="Markdown"
-        )
-        return
-
     if is_subscribed(user_id):
         await update.message.reply_text(
             f"👋 Welcome back, *{first_name}*!\n\n"
