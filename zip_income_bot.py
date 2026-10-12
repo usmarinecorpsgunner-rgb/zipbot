@@ -73,6 +73,15 @@ def track_user(user_id: str, username: str = "", first_name: str = "") -> bool:
 def get_all_user_ids() -> list:
     return [u["_id"] for u in users_col.find({}, {"_id": 1})]
 
+def get_free_runs_used(user_id: str) -> int:
+    doc = users_col.find_one({"_id": user_id})
+    return doc.get("free_runs_used", 0) if doc else 0
+
+def increment_free_run(user_id: str):
+    users_col.update_one({"_id": user_id}, {"$inc": {"free_runs_used": 1}}, upsert=True)
+
+FREE_RUNS_ALLOWED = 1  # one free lookup before paywall
+
 # ── Subscriptions ─────────────────────────────────────────────────────────────
 def is_admin(user_id: str) -> bool:
     return bool(ADMIN_USER_ID) and str(user_id) == str(ADMIN_USER_ID)
@@ -377,9 +386,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
+        runs_used = get_free_runs_used(user_id)
+        free_left = max(0, FREE_RUNS_ALLOWED - runs_used)
+        free_line = (
+            f"🎁 *You have 1 FREE test run!*\nJust send any ZIP code (like `90210`) to try it out.\n\n"
+            if free_left > 0 else
+            "🔒 You've used your free test run. Subscribe to continue!\n\n"
+        )
         await update.message.reply_text(
             f"👋 Hey *{first_name}*, welcome to *ZIP Income Bot*!\n\n"
             f"📊 Get median income, home values, population, poverty rate & more for any US ZIP.\n\n"
+            f"{free_line}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💳 *Plans:*\n"
             f"📅 1 Day — $2\n📅 7 Days — $7\n📅 30 Days — $15\n\n"
@@ -798,12 +815,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tokens = [t.strip().strip(",") for t in text.replace(",", " ").replace("\n", " ").split()]
     zips = [t for t in tokens if t.isdigit() and len(t) == 5]
     if zips:
-        if not is_subscribed(user_id):
-            await update.message.reply_text("🔒 *Access required!*", parse_mode="Markdown", reply_markup=plan_keyboard())
-            return
+        subscribed = is_subscribed(user_id)
+        free_run = False
+        if not subscribed:
+            # Allow one free test run
+            if get_free_runs_used(user_id) < FREE_RUNS_ALLOWED:
+                free_run = True
+                zips = zips[:1]  # free run = only 1 ZIP
+            else:
+                await update.message.reply_text(
+                    "🔒 *You've used your free test run!*\n\n"
+                    "Subscribe to unlock unlimited lookups, bulk search, screenshots, bins & more.\n\n"
+                    "👇 Pick a plan to continue:",
+                    parse_mode="Markdown",
+                    reply_markup=plan_keyboard()
+                )
+                return
         if len(zips) > 20:
             zips = zips[:20]
-        await update.message.reply_text(f"🔍 Looking up {len(zips)} ZIP(s)...")
+        if free_run:
+            await update.message.reply_text("🎁 *Free test run!* Looking up your ZIP...", parse_mode="Markdown")
+            increment_free_run(user_id)
+        else:
+            await update.message.reply_text(f"🔍 Looking up {len(zips)} ZIP(s)...")
         results, income_map = [], {}
         for z in zips:
             d = get_zip_data(z)
@@ -821,6 +855,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "🏆 *Ranked by Income:*\n\n" + "\n".join([f"{i+1}. `{z}` — ${v:,}" for i, (z, v) in enumerate(ranked)]),
                     parse_mode="Markdown"
                 )
+        if free_run:
+            await update.message.reply_text(
+                "✨ *That was your free test run!*\n\n"
+                "With a subscription you get:\n"
+                "✅ Unlimited lookups\n"
+                "✅ Bulk ZIP search (up to 20 at once)\n"
+                "✅ Screenshot reading\n"
+                "✅ Saved bins & history\n"
+                "✅ Income ranking\n\n"
+                "👇 Pick a plan to unlock everything:",
+                parse_mode="Markdown",
+                reply_markup=plan_keyboard()
+            )
         return
 
     # Redeem key by typing it
@@ -1009,8 +1056,25 @@ async def binlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk, parse_mode="Markdown")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+async def post_init(application):
+    """Set the persistent command menu shown in Telegram's menu button."""
+    from telegram import BotCommand
+    commands = [
+        BotCommand("start", "🏠 Main menu"),
+        BotCommand("pay", "💳 Subscribe"),
+        BotCommand("features", "⚡ See all features"),
+        BotCommand("status", "📊 Check subscription"),
+        BotCommand("history", "🕐 Recent lookups"),
+        BotCommand("compare", "⚖️ Compare ZIPs"),
+        BotCommand("bins", "📦 Saved lists"),
+        BotCommand("refer", "🤝 Earn free days"),
+        BotCommand("redeem", "🔑 Redeem a key"),
+        BotCommand("help", "❓ Help"),
+    ]
+    await application.bot.set_my_commands(commands)
+
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("pay", pay))
     app.add_handler(CommandHandler("status", status))
